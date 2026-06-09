@@ -20,6 +20,9 @@ class WebcamTrack(MediaStreamTrack):
     def __init__(self, camera_index=0, width=640, height=480, fps=30):
         super().__init__()
         self.cap = cv2.VideoCapture(camera_index)
+        if not self.cap.isOpened() and sys.platform == "win32":
+            self.cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+        
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.cap.set(cv2.CAP_PROP_FPS, fps)
@@ -162,7 +165,12 @@ def main():
     ap.add_argument("--turn-url", default="")
     ap.add_argument("--turn-user", default="")
     ap.add_argument("--turn-pass", default="")
+    ap.add_argument("--verbose", action="store_true", help="Enable debug logging")
     a = ap.parse_args()
+
+    if a.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
 
     try:
         asyncio.run(run_webrtc_client(a.url.rstrip("/"), a.camera, a.width, a.height, a.fps, a.vcam, a.vcam_width, a.vcam_height, a.turn_url, a.turn_user, a.turn_pass))
