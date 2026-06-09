@@ -604,11 +604,23 @@ cells.append(code([
     '        out.time_base = frame.time_base\n',
     '        return out\n',
     '\n',
+    '# ── Fix Google Cloud MTU for WebRTC DTLS ────────────────────\n',
+    'try:\n',
+    '    subprocess.run(["ip", "link", "set", "dev", "eth0", "mtu", "1200"], check=False)\n',
+    '    print("[✓] Network MTU adjusted to 1200 to prevent DTLS drops")\n',
+    'except Exception as e:\n',
+    '    pass\n',
+    '\n',
     '# ── Signaling Server ────────────────────────────────────────\n',
     '\n',
     'pcs = set()\n',
     'relay = MediaRelay()\n',
-    'RTC_CFG = RTCConfiguration(iceServers=[RTCIceServer(urls=["stun:stun.l.google.com:19302"])])\n',
+    'RTC_CFG = RTCConfiguration(iceServers=[\n',
+    '    RTCIceServer(urls=["stun:stun.l.google.com:19302"]),\n',
+    '    RTCIceServer(urls=["turn:openrelay.metered.ca:80"], username="openrelayproject", credential="openrelayproject"),\n',
+    '    RTCIceServer(urls=["turn:openrelay.metered.ca:443"], username="openrelayproject", credential="openrelayproject"),\n',
+    '    RTCIceServer(urls=["turn:openrelay.metered.ca:443?transport=tcp"], username="openrelayproject", credential="openrelayproject"),\n',
+    '])\n',
     '\n',
     'async def handle_offer(request):\n',
     '    try:\n',
@@ -855,7 +867,12 @@ async def run_client(url, camera, w, h, fps, vcam, vw, vh, retries, delay):
 async def _stream(url, camera, w, h, fps, use_vcam, vw, vh):
     """Connect, stream, display."""
     rx = FrameReceiver()
-    cfg = RTCConfiguration(iceServers=[RTCIceServer(urls=["stun:stun.l.google.com:19302"])])
+    cfg = RTCConfiguration(iceServers=[
+        RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
+        RTCIceServer(urls=["turn:openrelay.metered.ca:80"], username="openrelayproject", credential="openrelayproject"),
+        RTCIceServer(urls=["turn:openrelay.metered.ca:443"], username="openrelayproject", credential="openrelayproject"),
+        RTCIceServer(urls=["turn:openrelay.metered.ca:443?transport=tcp"], username="openrelayproject", credential="openrelayproject"),
+    ])
     pc = RTCPeerConnection(configuration=cfg)
     cam = WebcamTrack(camera, w, h, fps)
     pc.addTrack(cam)
