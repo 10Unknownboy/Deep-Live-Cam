@@ -52,15 +52,26 @@ async def ws_stream(url, camera, w, h, fps, use_vcam, vw, vh):
             mirror = False
             
             async def sender():
+                # Throttle sender to 15 FPS max to prevent TCP buffer bloat over Ngrok
+                send_fps = min(fps, 15)
                 while not ws.closed:
                     ret, frame = await asyncio.get_event_loop().run_in_executor(None, cap.read)
                     if not ret: break
-                    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                    
+                    # Downscale and compress heavily to guarantee low latency over free tunnels
+                    h, w = frame.shape[:2]
+                    if max(h, w) > 480:
+                        scale = 480 / max(h, w)
+                        send_frame = cv2.resize(frame, (int(w*scale), int(h*scale)))
+                    else:
+                        send_frame = frame
+                        
+                    _, buf = cv2.imencode(".jpg", send_frame, [cv2.IMWRITE_JPEG_QUALITY, 40])
                     try:
                         await ws.send_bytes(buf.tobytes())
                     except Exception:
                         break
-                    await asyncio.sleep(1.0 / fps)
+                    await asyncio.sleep(1.0 / send_fps)
                     
             async def receiver():
                 nonlocal mirror
@@ -127,7 +138,7 @@ def main():
     ap.add_argument("--camera", type=int, default=0, help="Camera index")
     ap.add_argument("--width", type=int, default=640, help="Capture width")
     ap.add_argument("--height", type=int, default=480, help="Capture height")
-    ap.add_argument("--fps", type=int, default=30, help="Capture FPS")
+    ap.add_argument("--fps", type=int, default=15, help="Capture FPS")
     ap.add_argument("--vcam", action="store_true", help="Enable virtual camera")
     ap.add_argument("--vcam-width", type=int, default=1280, help="VCam width")
     ap.add_argument("--vcam-height", type=int, default=720, help="VCam height")
