@@ -5,167 +5,135 @@ import logging
 import time
 import sys
 import threading
-from fractions import Fraction
 import cv2
 import numpy as np
 import aiohttp
-from av import VideoFrame
-from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack, RTCConfiguration, RTCIceServer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("dlc-client")
 
-class WebcamTrack(MediaStreamTrack):
-    kind = "video"
-    def __init__(self, camera_index=0, width=640, height=480, fps=30):
-        super().__init__()
-        self.cap = cv2.VideoCapture(camera_index)
-        if not self.cap.isOpened() and sys.platform == "win32":
-            self.cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
-        
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self.cap.set(cv2.CAP_PROP_FPS, fps)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Cannot open camera {camera_index}")
-        self._fps = fps
-        self._n = 0
-        
-    async def recv(self):
-        loop = asyncio.get_event_loop()
-        ret, frame = await loop.run_in_executor(None, self.cap.read)
-        if not ret:
-            raise EOFError("Camera disconnected")
-            
-        new_frame = VideoFrame.from_ndarray(frame, format="bgr24")
-        new_frame.pts = self._n
-        new_frame.time_base = Fraction(1, self._fps)
-        self._n += 1
-        
-        # Explicitly yield control to prevent event loop starvation
-        await asyncio.sleep(0.001)
-        return new_frame
+async def ws_stream(url, camera, w, h, fps, use_vcam, vw, vh):
+    ws_url = url.rstrip("/").replace("https://", "wss://").replace("http://", "ws://") + "/ws"
+    cap = cv2.VideoCapture(camera)
+    if not cap.isOpened() and sys.platform == "win32":
+        cap = cv2.VideoCapture(camera, cv2.CAP_DSHOW)
+    
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+    cap.set(cv2.CAP_PROP_FPS, fps)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    def stop(self):
-        super().stop()
-        if self.cap:
-            self.cap.release()
-
-async def run_webrtc_client(url, camera, width, height, fps, use_vcam, vw, vh, turn_url, turn_user, turn_pass):
-    while True:
-        ice = []
-        if turn_url:
-            ice.append(RTCIceServer(urls=[turn_url], username=turn_user, credential=turn_pass))
-        else:
-            ice.append(RTCIceServer(urls=["stun:stun.l.google.com:19302"]))
-            ice.append(RTCIceServer(urls=["turn:openrelay.metered.ca:80"], username="openrelayproject", credential="openrelayproject"))
-            ice.append(RTCIceServer(urls=["turn:openrelay.metered.ca:443"], username="openrelayproject", credential="openrelayproject"))
-            ice.append(RTCIceServer(urls=["turn:openrelay.metered.ca:443?transport=tcp"], username="openrelayproject", credential="openrelayproject"))
-
-        pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=ice))
-        cam_track = WebcamTrack(camera, width, height, fps)
-        pc.addTrack(cam_track)
-
-        vcam_dev = None
-        frames_count = 0
-        t0 = time.time()
-        current_fps = 0.0
-
-        @pc.on("track")
-        async def on_track(track):
-            nonlocal vcam_dev, frames_count, t0, current_fps
-            logger.info(f"Remote track received: {track.kind}")
-            
-            while True:
-                try:
-                    f = await track.recv()
-                    img = f.to_ndarray(format="bgr24")
-                    
-                    frames_count += 1
-                    now = time.time()
-                    if now - t0 >= 1.0:
-                        current_fps = frames_count / (now - t0)
-                        frames_count = 0
-                        t0 = now
-                        
-                    if use_vcam:
-                        if vcam_dev is None:
-                            import pyvirtualcam
-                            vcam_dev = pyvirtualcam.Camera(width=vw, height=vh, fps=fps, fmt=pyvirtualcam.PixelFormat.BGR)
-                        vcam_dev.send(cv2.resize(img, (vw, vh)))
-                        vcam_dev.sleep_until_next_frame()
-                    else:
-                        disp = img.copy()
-                        cv2.putText(disp, f"FPS: {current_fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                        cv2.imshow("Deep-Live-Cam WebRTC", disp)
-                        if cv2.waitKey(1) == ord('q'):
-                            break
-                            
-                except Exception as e:
-                    logger.error(f"Track receive error: {e}")
-                    break
-
-        @pc.on("iceconnectionstatechange")
-        async def on_ice():
-            logger.info(f"ICE State: {pc.iceConnectionState}")
-            if pc.iceConnectionState == "failed":
-                logger.warning("ICE failed. Attempting ICE Restart...")
-                pc.restartIce()
-                offer = await pc.createOffer()
-                await pc.setLocalDescription(offer)
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(f"{url}/offer", json={"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}) as resp:
-                            ans = await resp.json()
-                            await pc.setRemoteDescription(RTCSessionDescription(sdp=ans["sdp"], type=ans["type"]))
-                except Exception as e:
-                    logger.error(f"ICE Restart signaling failed: {e}")
-
-        # Initial Negotiation
-        offer = await pc.createOffer()
-        await pc.setLocalDescription(offer)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open camera {camera}")
+    
+    aw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    ah = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    logger.info(f"Camera opened: {aw}x{ah}")
+    
+    vcam_dev = None
+    if use_vcam:
         try:
-            logger.info(f"Connecting to {url}/offer")
-            async with aiohttp.ClientSession() as session:
-                hdrs = {"ngrok-skip-browser-warning": "true"}
-                async with session.post(f"{url}/offer", json={"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}, headers=hdrs) as resp:
-                    if resp.status != 200:
-                        raise RuntimeError(f"Server error: {await resp.text()}")
-                    ans = await resp.json()
-                    await pc.setRemoteDescription(RTCSessionDescription(sdp=ans["sdp"], type=ans["type"]))
+            import pyvirtualcam
+            vcam_dev = pyvirtualcam.Camera(width=vw, height=vh, fps=fps, fmt=pyvirtualcam.PixelFormat.BGR)
+            logger.info(f"Virtual cam: {vcam_dev.device}")
         except Exception as e:
-            logger.error(f"Signaling failed: {e}. Retrying in 5s...")
-            cam_track.stop()
-            await pc.close()
-            await asyncio.sleep(5)
-            continue
+            logger.warning(f"VCam unavailable: {e}")
+            
+    async with aiohttp.ClientSession() as session:
+        hdrs = {"ngrok-skip-browser-warning": "true"}
+        logger.info(f"Connecting to {ws_url} ...")
+        async with session.ws_connect(ws_url, headers=hdrs, max_msg_size=10*1024*1024) as ws:
+            logger.info("Connected!")
+            print("\n" + "=" * 50)
+            print("  Deep-Live-Cam Client Running (Decoupled WebSocket)")
+            print("  'q' = quit  |  'm' = mirror")
+            print("=" * 50 + "\n")
+            
+            mirror = False
+            
+            async def sender():
+                while not ws.closed:
+                    ret, frame = await asyncio.get_event_loop().run_in_executor(None, cap.read)
+                    if not ret: break
+                    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                    try:
+                        await ws.send_bytes(buf.tobytes())
+                    except Exception:
+                        break
+                    await asyncio.sleep(1.0 / fps)
+                    
+            async def receiver():
+                nonlocal mirror
+                frames_count = 0
+                t0 = time.time()
+                fps_val = 0.0
+                while not ws.closed:
+                    try:
+                        msg = await ws.receive()
+                    except Exception:
+                        break
+                    if msg.type == aiohttp.WSMsgType.BINARY:
+                        frames_count += 1
+                        now = time.time()
+                        if now - t0 >= 1.0:
+                            fps_val = frames_count / (now - t0)
+                            frames_count = 0
+                            t0 = now
+                            
+                        arr = np.frombuffer(msg.data, np.uint8)
+                        out_frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                        disp = cv2.flip(out_frame, 1) if mirror else out_frame.copy()
+                        cv2.putText(disp, f"FPS: {fps_val:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        cv2.imshow("Deep-Live-Cam", disp)
+                        
+                        if vcam_dev:
+                            try:
+                                vcam_dev.send(cv2.resize(out_frame, (vw, vh)))
+                                vcam_dev.sleep_until_next_frame()
+                            except: pass
+                            
+                        key = cv2.waitKey(1) & 0xFF
+                        if key == ord('q'):
+                            await ws.close()
+                            break
+                        elif key == ord('m'):
+                            mirror = not mirror
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
 
-        while pc.connectionState not in ("failed", "closed"):
-            await asyncio.sleep(1)
+            await asyncio.gather(sender(), receiver())
+            
+    cap.release()
+    cv2.destroyAllWindows()
+    if vcam_dev: vcam_dev.close()
 
-        logger.info("Connection lost. Reconnecting in 3 seconds...")
-        cam_track.stop()
-        await pc.close()
-        cv2.destroyAllWindows()
-        if vcam_dev:
-            vcam_dev.close()
-        await asyncio.sleep(3)
+async def run_client(url, camera, w, h, fps, use_vcam, vw, vh, retries, delay):
+    for attempt in range(1, retries + 1):
+        if attempt > 1:
+            logger.info(f"Retry {attempt}/{retries} in {delay}s...")
+            await asyncio.sleep(delay)
+        try:
+            await ws_stream(url, camera, w, h, fps, use_vcam, vw, vh)
+            return
+        except KeyboardInterrupt:
+            return
+        except Exception as e:
+            logger.error(f"Connection error: {e}")
+    logger.error(f"Max retries ({retries}) exceeded.")
 
 def main():
-    ap = argparse.ArgumentParser(description="Deep-Live-Cam WebRTC Client")
+    ap = argparse.ArgumentParser(description="Deep-Live-Cam Decoupled WebSocket Client")
     ap.add_argument("--url", required=True, help="Colab ngrok URL")
     ap.add_argument("--camera", type=int, default=0, help="Camera index")
-    ap.add_argument("--width", type=int, default=640)
-    ap.add_argument("--height", type=int, default=480)
-    ap.add_argument("--fps", type=int, default=30)
-    ap.add_argument("--vcam", action="store_true")
-    ap.add_argument("--vcam-width", type=int, default=1280)
-    ap.add_argument("--vcam-height", type=int, default=720)
-    ap.add_argument("--turn-url", default="")
-    ap.add_argument("--turn-user", default="")
-    ap.add_argument("--turn-pass", default="")
-    ap.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    ap.add_argument("--width", type=int, default=640, help="Capture width")
+    ap.add_argument("--height", type=int, default=480, help="Capture height")
+    ap.add_argument("--fps", type=int, default=30, help="Capture FPS")
+    ap.add_argument("--vcam", action="store_true", help="Enable virtual camera")
+    ap.add_argument("--vcam-width", type=int, default=1280, help="VCam width")
+    ap.add_argument("--vcam-height", type=int, default=720, help="VCam height")
+    ap.add_argument("--retries", type=int, default=10, help="Max retries")
+    ap.add_argument("--retry-delay", type=float, default=3.0, help="Retry delay")
+    ap.add_argument("--verbose", action="store_true", help="Enable debug")
     a = ap.parse_args()
 
     if a.verbose:
@@ -173,7 +141,7 @@ def main():
         logger.setLevel(logging.DEBUG)
 
     try:
-        asyncio.run(run_webrtc_client(a.url.rstrip("/"), a.camera, a.width, a.height, a.fps, a.vcam, a.vcam_width, a.vcam_height, a.turn_url, a.turn_user, a.turn_pass))
+        asyncio.run(run_client(a.url, a.camera, a.width, a.height, a.fps, a.vcam, a.vcam_width, a.vcam_height, a.retries, a.retry_delay))
     except KeyboardInterrupt:
         pass
 
