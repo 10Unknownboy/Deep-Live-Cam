@@ -113,9 +113,8 @@ cells.append(code([
     '\n',
     '# WebRTC + server packages\n',
     'webrtc_deps = [\n',
-    '    "aiortc>=1.9.0", "aiohttp>=3.9.0", "av>=12.0.0",\n',
-    '    "pyngrok>=7.0.0", "opencv-python>=4.8.0", "onnxruntime-gpu==1.21.0",\n',
-    '    "numpy==1.26.4", "scipy==1.13.1",\n',
+    '    "aiohttp>=3.9.0", "pyngrok>=7.0.0", "opencv-python>=4.8.0",\n',
+    '    "onnxruntime-gpu==1.21.0", "numpy==1.26.4", "scipy==1.13.1",\n',
     ']\n',
     'subprocess.run([sys.executable, "-m", "pip", "install", "-q"] + webrtc_deps, check=True)\n',
     'print("[✓] WebRTC / server dependencies installed")\n',
@@ -353,30 +352,18 @@ cells.append(md([
 
 cells.append(code([
     '#@title Initialize DLC & Launch Signaling Server\n',
-    '#@markdown Loads models, warms up GPU, and starts the WebRTC server.\n',
+    '#@markdown Loads models, warms up GPU, and starts the WebSocket server.\n',
     '\n',
-    'import os, sys, time, json, asyncio, threading, traceback, logging\n',
-    'from collections import deque\n',
-    '\n',
-    '# ── WebRTC Imports (Must be BEFORE cv2/torch to prevent FFmpeg segfaults) ──\n',
-    'import av\n',
-    'from av import VideoFrame\n',
+    'import os, sys, time, asyncio, threading, logging\n',
     'from aiohttp import web\n',
-    'from aiortc import (\n',
-    '    RTCPeerConnection, RTCSessionDescription,\n',
-    '    MediaStreamTrack, RTCConfiguration, RTCIceServer,\n',
-    ')\n',
-    'from aiortc.contrib.media import MediaRelay\n',
-    '\n',
-    'import numpy as np\n',
+    'from pyngrok import ngrok, conf\n',
     'import cv2\n',
+    'import numpy as np\n',
     '\n',
     '# ── DLC Initialization ──────────────────────────────────────\n',
     'DLC_DIR = "/content/Deep-Live-Cam"\n',
     'sys.path.insert(0, DLC_DIR)\n',
     'os.chdir(DLC_DIR)\n',
-    '\n',
-
     '\n',
     'os.environ["OMP_NUM_THREADS"] = "6"\n',
     'os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"\n',
@@ -456,8 +443,6 @@ cells.append(code([
     '    pm.pre_check()\n',
     '    print(f"[✓] Processor ready: {pm.NAME}")\n',
     '\n',
-    '\n',
-    '\n',
     '# ── Performance Metrics ──────────────────────────────────────\n',
     '\n',
     'class PerfMetrics:\n',
@@ -471,6 +456,7 @@ cells.append(code([
     '        self.connected_clients = 0\n',
     '        self.frames_processed = 0\n',
     '        self.frames_dropped = 0\n',
+    '        from collections import deque\n',
     '        self._input_t = deque(maxlen=60)\n',
     '        self._output_t = deque(maxlen=60)\n',
     '        self._infer_t = deque(maxlen=30)\n',
@@ -517,209 +503,95 @@ cells.append(code([
     '\n',
     'metrics = PerfMetrics()\n',
     '\n',
-    '# ── WebRTC Video Track ──────────────────────────────────────\n',
+    '# ── WebSocket Server ────────────────────────────────────────\n',
     '\n',
     'PROC_RES = CONFIG.get("processing_resolution", 640)\n',
     'FPS_LIMIT = CONFIG.get("fps_limit", 30)\n',
     'MIN_INTERVAL = 1.0 / FPS_LIMIT\n',
     'DET_CONF = CONFIG.get("face_detection_confidence", 0.5)\n',
     '\n',
-    'class FaceSwapTrack(MediaStreamTrack):\n',
-    '    """Receives frames, runs DLC face swap, returns processed frames."""\n',
-    '    kind = "video"\n',
-    '\n',
-    '    def __init__(self, track):\n',
-    '        super().__init__()\n',
-    '        self.track = track\n',
-    '        self._last_t = 0\n',
-    '        self._last_result = None\n',
-    '\n',
-    '    def _process_sync(self, bgr):\n',
-    '        """Run face swap in thread pool (never blocks event loop)."""\n',
-    '        try:\n',
-    '            h, w = bgr.shape[:2]\n',
-    '            scale = 1.0\n',
-    '            if max(h, w) > PROC_RES:\n',
-    '                scale = PROC_RES / max(h, w)\n',
-    '                nw, nh = int(w * scale), int(h * scale)\n',
-    '                proc = cv2.resize(bgr, (nw, nh), interpolation=cv2.INTER_LINEAR)\n',
-    '            else:\n',
-    '                proc = bgr\n',
-    '\n',
-    '            t0 = time.time()\n',
-    '            # Fast detection path (skips landmarks / recognition)\n',
-    '            target = detect_one_face_fast(proc) if not modules.globals.many_faces else None\n',
-    '            if target is not None and target.det_score < DET_CONF:\n',
-    '                target = None\n',
-    '\n',
-    '            if target is not None or modules.globals.many_faces:\n',
-    '                for pm in processor_modules:\n',
-    '                    try:\n',
-    '                        proc = pm.process_frame(source_face, proc, target_face=target)\n',
-    '                    except TypeError:\n',
-    '                        proc = pm.process_frame(source_face, proc)\n',
-    '\n',
-    '            metrics.record_inference((time.time() - t0) * 1000)\n',
-    '            if scale != 1.0:\n',
-    '                proc = cv2.resize(proc, (w, h), interpolation=cv2.INTER_LINEAR)\n',
-    '            metrics.record_output()\n',
-    '            return proc\n',
-    '        except Exception as e:\n',
-    '            logging.error(f"Processing error: {e}")\n',
-    '            return bgr\n',
-    '\n',
-    '    async def recv(self):\n',
-    '        frame = await self.track.recv()\n',
-    '        metrics.record_input()\n',
-    '\n',
-    '        # FPS limiting — reuse last result if too fast\n',
-    '        now = time.time()\n',
-    '        if (now - self._last_t) < MIN_INTERVAL and self._last_result is not None:\n',
-    '            metrics.record_drop()\n',
-    '            out = VideoFrame.from_ndarray(self._last_result, format="bgr24")\n',
-    '            out.pts = frame.pts\n',
-    '            out.time_base = frame.time_base\n',
-    '            return out\n',
-    '        self._last_t = now\n',
-    '\n',
-    '        try:\n',
-    '            img = frame.to_ndarray(format="bgr24")\n',
-    '        except Exception:\n',
-    '            if self._last_result is not None:\n',
-    '                out = VideoFrame.from_ndarray(self._last_result, format="bgr24")\n',
-    '                out.pts = frame.pts\n',
-    '                out.time_base = frame.time_base\n',
-    '                return out\n',
-    '            return frame\n',
-    '\n',
-    '        loop = asyncio.get_event_loop()\n',
-    '        try:\n',
-    '            result = await loop.run_in_executor(None, self._process_sync, img)\n',
-    '            self._last_result = result\n',
-    '        except Exception:\n',
-    '            result = img\n',
-    '\n',
-    '        out = VideoFrame.from_ndarray(result, format="bgr24")\n',
-    '        out.pts = frame.pts\n',
-    '        out.time_base = frame.time_base\n',
-    '        return out\n',
-    '\n',
-    '# ── Fix Google Cloud MTU for WebRTC DTLS ────────────────────\n',
-    'try:\n',
-    '    subprocess.run(["ip", "link", "set", "dev", "eth0", "mtu", "1200"], check=False)\n',
-    '    print("[✓] Network MTU adjusted to 1200 to prevent DTLS drops")\n',
-    'except Exception as e:\n',
-    '    pass\n',
-    '\n',
-    '# ── Signaling Server ────────────────────────────────────────\n',
-    '\n',
-    'pcs = set()\n',
-    'relay = MediaRelay()\n',
-    'RTC_CFG = RTCConfiguration(iceServers=[\n',
-    '    RTCIceServer(urls=["stun:stun.l.google.com:19302"]),\n',
-    '    RTCIceServer(urls=["turn:openrelay.metered.ca:80"], username="openrelayproject", credential="openrelayproject"),\n',
-    '    RTCIceServer(urls=["turn:openrelay.metered.ca:443"], username="openrelayproject", credential="openrelayproject"),\n',
-    '    RTCIceServer(urls=["turn:openrelay.metered.ca:443?transport=tcp"], username="openrelayproject", credential="openrelayproject"),\n',
-    '])\n',
-    '\n',
-    'async def handle_offer(request):\n',
+    'def _process_sync(bgr):\n',
+    '    """Run face swap processing."""\n',
     '    try:\n',
-    '        params = await request.json()\n',
-    '        offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])\n',
+    '        h, w = bgr.shape[:2]\n',
+    '        scale = 1.0\n',
+    '        if max(h, w) > PROC_RES:\n',
+    '            scale = PROC_RES / max(h, w)\n',
+    '            nw, nh = int(w * scale), int(h * scale)\n',
+    '            proc = cv2.resize(bgr, (nw, nh), interpolation=cv2.INTER_LINEAR)\n',
+    '        else:\n',
+    '            proc = bgr\n',
+    '\n',
+    '        t0 = time.time()\n',
+    '        target = detect_one_face_fast(proc) if not modules.globals.many_faces else None\n',
+    '        if target is not None and target.det_score < DET_CONF:\n',
+    '            target = None\n',
+    '\n',
+    '        if target is not None or modules.globals.many_faces:\n',
+    '            for pm in processor_modules:\n',
+    '                try:\n',
+    '                    proc = pm.process_frame(source_face, proc, target_face=target)\n',
+    '                except TypeError:\n',
+    '                    proc = pm.process_frame(source_face, proc)\n',
+    '\n',
+    '        metrics.record_inference((time.time() - t0) * 1000)\n',
+    '        if scale != 1.0:\n',
+    '            proc = cv2.resize(proc, (w, h), interpolation=cv2.INTER_LINEAR)\n',
+    '        metrics.record_output()\n',
+    '        return proc\n',
     '    except Exception as e:\n',
-    '        return web.json_response({"error": str(e)}, status=400)\n',
+    '        logging.error(f"Processing error: {e}")\n',
+    '        return bgr\n',
     '\n',
-    '    pc = RTCPeerConnection(configuration=RTC_CFG)\n',
-    '    pcs.add(pc)\n',
-    '    metrics.connected_clients = len(pcs)\n',
-    '    print(f"[WebRTC] New peer (total: {len(pcs)})")\n',
+    'async def handle_ws(request):\n',
+    '    ws = web.WebSocketResponse(max_msg_size=10*1024*1024)\n',
+    '    await ws.prepare(request)\n',
+    '    metrics.connected_clients += 1\n',
+    '    print("[WS] Client connected")\n',
+    '    loop = asyncio.get_event_loop()\n',
     '\n',
-    '    @pc.on("connectionstatechange")\n',
-    '    async def on_state():\n',
-    '        st = pc.connectionState\n',
-    '        print(f"[WebRTC] State: {st}")\n',
-    '        if st in ("failed", "closed"):\n',
-    '            await pc.close()\n',
-    '            pcs.discard(pc)\n',
-    '            metrics.connected_clients = len(pcs)\n',
-    '            try:\n',
-    '                import torch\n',
-    '                if torch.cuda.is_available():\n',
-    '                    torch.cuda.empty_cache()\n',
-    '            except ImportError:\n',
-    '                pass\n',
+    '    last_result = None\n',
+    '    last_t = 0\n',
     '\n',
-    '    @pc.on("track")\n',
-    '    def on_track(track):\n',
-    '        print(f"[WebRTC] Track: {track.kind}")\n',
-    '        if track.kind == "video":\n',
-    '            pc.addTrack(FaceSwapTrack(relay.subscribe(track)))\n',
-    '        @track.on("ended")\n',
-    '        async def on_ended():\n',
-    '            print(f"[WebRTC] Track ended: {track.kind}")\n',
-    '\n',
-    '    await pc.setRemoteDescription(offer)\n',
-    '    answer = await pc.createAnswer()\n',
-    '    await pc.setLocalDescription(answer)\n',
-    '    return web.json_response({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type})\n',
+    '    try:\n',
+    '        async for msg in ws:\n',
+    '            if msg.type == web.WSMsgType.BINARY:\n',
+    '                metrics.record_input()\n',
+    '                now = time.time()\n',
+    '                if (now - last_t) < MIN_INTERVAL and last_result is not None:\n',
+    '                    metrics.record_drop()\n',
+    '                    _, buf = cv2.imencode(".jpg", last_result, [cv2.IMWRITE_JPEG_QUALITY, 70])\n',
+    '                    await ws.send_bytes(buf.tobytes())\n',
+    '                    continue\n',
+    '                last_t = now\n',
+    '                try:\n',
+    '                    arr = np.frombuffer(msg.data, np.uint8)\n',
+    '                    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)\n',
+    '                    if img is not None:\n',
+    '                        result = await loop.run_in_executor(None, _process_sync, img)\n',
+    '                        last_result = result\n',
+    '                        _, buf = cv2.imencode(".jpg", result, [cv2.IMWRITE_JPEG_QUALITY, 70])\n',
+    '                        await ws.send_bytes(buf.tobytes())\n',
+    '                except Exception as e:\n',
+    '                    logging.error(f"WS Process error: {e}")\n',
+    '            elif msg.type == web.WSMsgType.ERROR:\n',
+    '                logging.error(f"WS error: {ws.exception()}")\n',
+    '    finally:\n',
+    '        metrics.connected_clients = max(0, metrics.connected_clients - 1)\n',
+    '        print("[WS] Client disconnected")\n',
+    '    return ws\n',
     '\n',
     'async def handle_health(request):\n',
     '    snap = metrics.snapshot()\n',
-    '    gpu = {}\n',
-    '    try:\n',
-    '        import torch\n',
-    '        if torch.cuda.is_available():\n',
-    '            gpu = dict(\n',
-    '                gpu_name=torch.cuda.get_device_name(0),\n',
-    '                vram_alloc_mb=round(torch.cuda.memory_allocated(0)/1e6, 1),\n',
-    '                vram_total_mb=round(torch.cuda.get_device_properties(0).total_memory/1e6, 1),\n',
-    '            )\n',
-    '    except ImportError:\n',
-    '        pass\n',
-    '    return web.json_response({"status": "ok", "metrics": snap, "gpu": gpu})\n',
+    '    return web.json_response({"status": "ok", "metrics": snap})\n',
     '\n',
     'async def handle_index(request):\n',
-    '    s = metrics.snapshot()\n',
-    '    html = (\n',
-    '        "<html><head><title>DLC Server</title>"\n',
-    '        "<style>body{font-family:monospace;background:#1a1a2e;color:#e0e0e0;padding:40px}"\n',
-    '        "h1{color:#00d4ff}td,th{padding:6px 14px;border:1px solid #333}"\n',
-    '        "th{background:#16213e;color:#00d4ff}.ok{color:#0f8}</style></head><body>"\n',
-    '        "<h1>🎭 Deep-Live-Cam WebRTC Server</h1><p class=ok>● Running</p>"\n',
-    '        f"<table><tr><th>Metric</th><th>Value</th></tr>"\n',
-    '        f"<tr><td>Clients</td><td>{s[\'connected_clients\']}</td></tr>"\n',
-    '        f"<tr><td>In FPS</td><td>{s[\'input_fps\']}</td></tr>"\n',
-    '        f"<tr><td>Out FPS</td><td>{s[\'output_fps\']}</td></tr>"\n',
-    '        f"<tr><td>Inference</td><td>{s[\'inference_ms\']} ms</td></tr>"\n',
-    '        f"<tr><td>Processed</td><td>{s[\'frames_processed\']}</td></tr>"\n',
-    '        f"<tr><td>Dropped</td><td>{s[\'frames_dropped\']}</td></tr></table></body></html>"\n',
-    '    )\n',
-    '    return web.Response(text=html, content_type="text/html")\n',
+    '    return web.Response(text="<h1>Deep-Live-Cam WebSocket Server</h1>", content_type="text/html")\n',
     '\n',
-    'async def on_shutdown(app):\n',
-    '    await asyncio.gather(*(pc.close() for pc in pcs))\n',
-    '    pcs.clear()\n',
-    '\n',
-    '# CORS middleware\n',
-    '@web.middleware\n',
-    'async def cors_mw(request, handler):\n',
-    '    if request.method == "OPTIONS":\n',
-    '        resp = web.Response()\n',
-    '    else:\n',
-    '        try:\n',
-    '            resp = await handler(request)\n',
-    '        except web.HTTPException as ex:\n',
-    '            resp = ex\n',
-    '    resp.headers["Access-Control-Allow-Origin"] = "*"\n',
-    '    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"\n',
-    '    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"\n',
-    '    return resp\n',
-    '\n',
-    'app = web.Application(middlewares=[cors_mw])\n',
+    'app = web.Application()\n',
     'app.router.add_get("/", handle_index)\n',
-    'app.router.add_post("/offer", handle_offer)\n',
+    'app.router.add_get("/ws", handle_ws)\n',
     'app.router.add_get("/health", handle_health)\n',
-    'app.on_shutdown.append(on_shutdown)\n',
     '\n',
     'def _run_server():\n',
     '    loop = asyncio.new_event_loop()\n',
@@ -730,17 +602,12 @@ cells.append(code([
     '    loop.run_until_complete(site.start())\n',
     '    print(f"\\n[✓] Server on port {SERVER_PORT}")\n',
     '    print(f"[✓] Ngrok: {_ngrok_url}")\n',
-    '    sep = "=" * 60\n',
-    '    print(f"\\n{sep}")\n',
-    '    print(f"  🎭 READY — run client.py with:")\n',
-    '    print(f"  python client.py --url {_ngrok_url}")\n',
-    '    print(f"{sep}\\n")\n',
     '    loop.run_forever()\n',
     '\n',
     'server_thread = threading.Thread(target=_run_server, daemon=True)\n',
     'server_thread.start()\n',
     'time.sleep(2)\n',
-    'print("[✓] Server running. Proceed to Cell 7 to get the client.")'
+    'print("[✓] Server running. Proceed to Cell 7.")'
 ]))
 
 # ============================================================
@@ -751,111 +618,26 @@ cells.append(md([
     "Downloads `client.py` for your local PC. Run it to start streaming."
 ]))
 
-# We'll put the client code inline
 CLIENT_CODE = r'''#!/usr/bin/env python3
-"""Deep-Live-Cam WebRTC Client
-
-Streams your local webcam to a remote Deep-Live-Cam Colab server
-via WebRTC and displays the face-swapped result in real time.
-
-Usage:
-    pip install aiortc aiohttp opencv-python av pyvirtualcam
-    python client.py --url https://xxxx.ngrok-free.app
-    python client.py --url https://xxxx.ngrok-free.app --camera 1 --vcam
-"""
+# You only need: aiohttp, opencv-python, numpy, pyvirtualcam (optional)
 
 import argparse
 import asyncio
 import logging
-import sys
 import time
-import threading
-from fractions import Fraction
-
 import aiohttp
 import cv2
 import numpy as np
-from av import VideoFrame
-from aiortc import (
-    RTCPeerConnection, RTCSessionDescription,
-    MediaStreamTrack, RTCConfiguration, RTCIceServer,
-)
 
 logger = logging.getLogger("dlc-client")
 
-
-class WebcamTrack(MediaStreamTrack):
-    """Captures frames from local webcam and sends via WebRTC."""
-    kind = "video"
-
-    def __init__(self, camera_index=0, width=640, height=480, fps=30):
-        super().__init__()
-        self.cap = cv2.VideoCapture(camera_index)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self.cap.set(cv2.CAP_PROP_FPS, fps)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Cannot open camera {camera_index}")
-        aw = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        ah = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        af = self.cap.get(cv2.CAP_PROP_FPS)
-        logger.info(f"Camera opened: {aw}x{ah} @ {af}fps")
-        self._time_base = Fraction(1, fps)
-        self._pts = 0
-
-    async def recv(self):
-        loop = asyncio.get_event_loop()
-        ret, frame = await loop.run_in_executor(None, self.cap.read)
-        if not ret:
-            raise RuntimeError("Failed to read from camera")
-        vf = VideoFrame.from_ndarray(frame, format="bgr24")
-        vf.pts = self._pts
-        vf.time_base = self._time_base
-        self._pts += 1
-        return vf
-
-    def stop(self):
-        super().stop()
-        if self.cap:
-            self.cap.release()
-
-
-class FrameReceiver:
-    """Collects frames from remote processed video track."""
-    def __init__(self):
-        self.frame = None
-        self.lock = threading.Lock()
-        self.count = 0
-        self._ts = []
-        self.fps = 0.0
-
-    def update(self, bgr):
-        with self.lock:
-            self.frame = bgr
-            self.count += 1
-            now = time.time()
-            self._ts.append(now)
-            if len(self._ts) > 30:
-                self._ts = self._ts[-30:]
-            if len(self._ts) >= 2:
-                dt = self._ts[-1] - self._ts[0]
-                if dt > 0:
-                    self.fps = (len(self._ts) - 1) / dt
-
-    def get(self):
-        with self.lock:
-            return self.frame.copy() if self.frame is not None else None
-
-
-async def run_client(url, camera, w, h, fps, vcam, vw, vh, retries, delay):
-    """Main loop with auto-reconnect."""
+async def run_client(url, camera, w, h, fps, use_vcam, vw, vh, retries, delay):
     for attempt in range(1, retries + 1):
         if attempt > 1:
             logger.info(f"Retry {attempt}/{retries} in {delay}s...")
             await asyncio.sleep(delay)
         try:
-            await _stream(url, camera, w, h, fps, vcam, vw, vh)
+            await _stream(url, camera, w, h, fps, use_vcam, vw, vh)
             return
         except KeyboardInterrupt:
             return
@@ -863,131 +645,87 @@ async def run_client(url, camera, w, h, fps, vcam, vw, vh, retries, delay):
             logger.error(f"Connection error: {e}")
     logger.error(f"Max retries ({retries}) exceeded.")
 
-
 async def _stream(url, camera, w, h, fps, use_vcam, vw, vh):
-    """Connect, stream, display."""
-    rx = FrameReceiver()
-    cfg = RTCConfiguration(iceServers=[
-        RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
-        RTCIceServer(urls=["turn:openrelay.metered.ca:80"], username="openrelayproject", credential="openrelayproject"),
-        RTCIceServer(urls=["turn:openrelay.metered.ca:443"], username="openrelayproject", credential="openrelayproject"),
-        RTCIceServer(urls=["turn:openrelay.metered.ca:443?transport=tcp"], username="openrelayproject", credential="openrelayproject"),
-    ])
-    pc = RTCPeerConnection(configuration=cfg)
-    cam = WebcamTrack(camera, w, h, fps)
-    pc.addTrack(cam)
-
-    @pc.on("track")
-    def on_track(track):
-        logger.info(f"Remote track: {track.kind}")
-        if track.kind == "video":
-            asyncio.ensure_future(_consume(track, rx))
-
-    @pc.on("connectionstatechange")
-    async def on_state():
-        logger.info(f"State: {pc.connectionState}")
-        if pc.connectionState in ("failed", "closed"):
-            raise ConnectionError("WebRTC lost")
-
-    offer = await pc.createOffer()
-    await pc.setLocalDescription(offer)
-
-    offer_url = url.rstrip("/") + "/offer"
-    logger.info(f"Sending offer to {offer_url}")
-
-    async with aiohttp.ClientSession() as sess:
-        hdrs = {"Content-Type": "application/json", "ngrok-skip-browser-warning": "true"}
-        payload = {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
-        async with sess.post(offer_url, json=payload, headers=hdrs, ssl=False) as resp:
-            if resp.status != 200:
-                raise RuntimeError(f"Server {resp.status}: {await resp.text()}")
-            ans = await resp.json()
-
-    await pc.setRemoteDescription(RTCSessionDescription(sdp=ans["sdp"], type=ans["type"]))
-    logger.info("Connected!")
-
+    ws_url = url.rstrip("/").replace("https://", "wss://").replace("http://", "ws://") + "/ws"
+    cap = cv2.VideoCapture(camera)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+    cap.set(cv2.CAP_PROP_FPS, fps)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open camera {camera}")
+    aw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    ah = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    logger.info(f"Camera opened: {aw}x{ah}")
     vcam_dev = None
     if use_vcam:
         try:
             import pyvirtualcam
-            vcam_dev = pyvirtualcam.Camera(width=vw, height=vh, fps=fps,
-                                           fmt=pyvirtualcam.PixelFormat.BGR)
+            vcam_dev = pyvirtualcam.Camera(width=vw, height=vh, fps=fps, fmt=pyvirtualcam.PixelFormat.BGR)
             logger.info(f"Virtual cam: {vcam_dev.device}")
         except Exception as e:
             logger.warning(f"VCam unavailable: {e}")
-
-    print("\n" + "=" * 50)
-    print("  Deep-Live-Cam Client Running")
-    print("  'q' = quit  |  'm' = mirror")
-    print("=" * 50 + "\n")
-
-    mirror = False
-    try:
-        while True:
-            f = rx.get()
-            if f is not None:
-                disp = cv2.flip(f, 1) if mirror else f.copy()
-                cv2.putText(disp, f"FPS: {rx.fps:.1f} | #{rx.count}",
-                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.imshow("Deep-Live-Cam", disp)
-                if vcam_dev:
-                    try:
-                        vcam_dev.send(cv2.resize(f, (vw, vh)))
-                        vcam_dev.sleep_until_next_frame()
-                    except Exception:
-                        pass
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                break
-            elif key == ord("m"):
-                mirror = not mirror
-                print(f"Mirror: {'ON' if mirror else 'OFF'}")
-            await asyncio.sleep(0.001)
-    finally:
-        cv2.destroyAllWindows()
-        cam.stop()
-        if vcam_dev:
-            vcam_dev.close()
-        await pc.close()
-
-
-async def _consume(track, rx):
-    while True:
-        try:
-            frame = await track.recv()
-            rx.update(frame.to_ndarray(format="bgr24"))
-        except Exception:
-            break
-
+    logger.info(f"Connecting to {ws_url} ...")
+    async with aiohttp.ClientSession() as session:
+        hdrs = {"ngrok-skip-browser-warning": "true"}
+        async with session.ws_connect(ws_url, headers=hdrs, max_msg_size=10*1024*1024) as ws:
+            logger.info("Connected!")
+            print("\n" + "=" * 50)
+            print("  Deep-Live-Cam Client Running (WebSocket)")
+            print("  'q' = quit  |  'm' = mirror")
+            print("=" * 50 + "\n")
+            mirror = False
+            frames_count = 0
+            try:
+                while True:
+                    for _ in range(3): cap.grab()
+                    ret, frame = cap.read()
+                    if not ret:
+                        logger.error("Camera read failed")
+                        break
+                    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                    t0 = time.time()
+                    await ws.send_bytes(buf.tobytes())
+                    msg = await ws.receive()
+                    if msg.type == aiohttp.WSMsgType.BINARY:
+                        dt = time.time() - t0
+                        fps_val = 1.0 / dt if dt > 0 else 0
+                        frames_count += 1
+                        arr = np.frombuffer(msg.data, np.uint8)
+                        out_frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                        disp = cv2.flip(out_frame, 1) if mirror else out_frame.copy()
+                        cv2.putText(disp, f"Ping: {dt*1000:.0f}ms | FPS: {fps_val:.1f} | #{frames_count}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        cv2.imshow("Deep-Live-Cam", disp)
+                        if vcam_dev:
+                            try:
+                                vcam_dev.send(cv2.resize(out_frame, (vw, vh)))
+                                vcam_dev.sleep_until_next_frame()
+                            except Exception: pass
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        logger.error("WebSocket closed by server.")
+                        break
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord("q"): break
+                    elif key == ord("m"): mirror = not mirror
+            finally:
+                cv2.destroyAllWindows()
+                cap.release()
+                if vcam_dev: vcam_dev.close()
 
 def main():
-    ap = argparse.ArgumentParser(description="Deep-Live-Cam WebRTC Client")
+    ap = argparse.ArgumentParser(description="Deep-Live-Cam WebSocket Client")
     ap.add_argument("--url", required=True, help="Colab ngrok URL")
     ap.add_argument("--camera", type=int, default=0, help="Camera index")
-    ap.add_argument("--width", type=int, default=640)
-    ap.add_argument("--height", type=int, default=480)
-    ap.add_argument("--fps", type=int, default=30)
-    ap.add_argument("--vcam", action="store_true", help="Virtual camera output")
-    ap.add_argument("--vcam-width", type=int, default=1280)
-    ap.add_argument("--vcam-height", type=int, default=720)
-    ap.add_argument("--retries", type=int, default=10)
-    ap.add_argument("--retry-delay", type=float, default=3.0)
-    ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--width", type=int, default=640, help="Capture width")
+    ap.add_argument("--height", type=int, default=480, help="Capture height")
+    ap.add_argument("--fps", type=int, default=30, help="Capture FPS")
+    ap.add_argument("--vcam", action="store_true", help="Enable virtual camera")
+    ap.add_argument("--vcam-width", type=int, default=1280, help="VCam width")
+    ap.add_argument("--vcam-height", type=int, default=720, help="VCam height")
+    ap.add_argument("--retries", type=int, default=10, help="Max retries")
+    ap.add_argument("--retry-delay", type=float, default=3.0, help="Retry delay")
+    ap.add_argument("--verbose", action="store_true", help="Enable debug")
     a = ap.parse_args()
-
-    logging.basicConfig(
-        level=logging.DEBUG if a.verbose else logging.INFO,
-        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
-    print("\n" + "=" * 50)
-    print("  🎭 Deep-Live-Cam WebRTC Client")
-    print("=" * 50)
-    print(f"  Server:  {a.url}")
-    print(f"  Camera:  {a.camera} ({a.width}x{a.height} @ {a.fps}fps)")
-    print(f"  VCam:    {'ON' if a.vcam else 'OFF'}")
-    print("=" * 50 + "\n")
-
     try:
         asyncio.run(run_client(a.url, a.camera, a.width, a.height, a.fps,
                                a.vcam, a.vcam_width, a.vcam_height,
