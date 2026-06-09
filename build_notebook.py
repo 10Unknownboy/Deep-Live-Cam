@@ -984,9 +984,9 @@ cells.append(code([
     '#@title Generate client.py\n',
     '#@markdown Downloads the local Python client for your PC.\n',
     '\n',
-    'CLIENT_CODE = """\n',
+    'CLIENT_CODE = r\'\'\'\n',
 ] + [line + '\n' for line in CLIENT_CODE.split('\n')] + [
-    '"""\n',
+    '\'\'\'\n',
     '\n',
     '# Write client.py\n',
     'for p in ["/content/client.py", "/content/Deep-Live-Cam/client.py"]:\n',
