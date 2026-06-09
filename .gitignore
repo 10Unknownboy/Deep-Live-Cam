@@ -29,3 +29,4 @@ switch_states.json
 install.bat
 /.claude
 *.bat
+client(1).py
